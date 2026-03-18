@@ -3,6 +3,12 @@ from alpaca.trading.client import TradingClient
 from alpaca.data.historical.crypto import CryptoHistoricalDataClient
 import os
 from datetime import datetime
+from coil.detector import detect_coil  
+from fastapi import FastAPI, BackgroundTasks
+from alpaca.trading.client import TradingClient
+from alpaca.data.historical.crypto import CryptoHistoricalDataClient
+import os
+from datetime import datetime
 
 app = FastAPI()
 
