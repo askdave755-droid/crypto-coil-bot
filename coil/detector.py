@@ -23,20 +23,24 @@ def calculate_atr(df, length=14):
     df['atr'] = df['tr'].rolling(window=length).mean()
     return df
 
+def safe_float(val):
+    """Convert numpy/pandas float to Python float safely"""
+    if pd.isna(val):
+        return None
+    return float(val)
+
 def detect_coil(symbol: str, data_client=None):
     """
     Detect Bollinger Squeeze (coil pattern) on crypto
     Returns: (is_coil: bool, data: dict)
     """
     try:
-        # Use provided client or create new one
         if data_client is None:
             data_client = CryptoHistoricalDataClient(
                 os.getenv('ALPACA_API_KEY'),
                 os.getenv('ALPACA_SECRET_KEY')
             )
         
-        # Get recent bars (15-min timeframe)
         req = CryptoBarsRequest(
             symbol_or_symbols=[symbol],
             timeframe=TimeFrame(15, TimeFrameUnit.Minute),
@@ -47,80 +51,67 @@ def detect_coil(symbol: str, data_client=None):
         
         if bars.empty or len(bars) < 30:
             return False, {
-                'symbol': symbol,
+                'symbol': str(symbol),
                 'error': 'Insufficient data',
-                'bars_received': len(bars)
+                'bars_received': int(len(bars))
             }
         
-        # Reset index if multi-index
         if isinstance(bars.index, pd.MultiIndex):
             df = bars.reset_index(level='symbol', drop=True)
         else:
             df = bars.copy()
         
-        # Calculate indicators
         df = calculate_bollinger_bands(df)
         df = calculate_atr(df)
         
-        # EMAs for trend
         df['ema_12'] = df['close'].ewm(span=12, adjust=False).mean()
         df['ema_26'] = df['close'].ewm(span=26, adjust=False).mean()
-        
-        # Volume analysis
         df['volume_sma'] = df['volume'].rolling(20).mean()
         
-        # Get latest values
         latest = df.iloc[-1]
         
-        # Coil detection metrics
-        bandwidth = (latest['bb_upper'] - latest['bb_lower']) / latest['bb_middle']
-        atr_current = latest['atr']
-        atr_mean = df['atr'].rolling(20).mean().iloc[-1]
-        volume_current = latest['volume']
-        volume_mean = latest['volume_sma']
+        bandwidth = float((latest['bb_upper'] - latest['bb_lower']) / latest['bb_middle'])
+        atr_current = float(latest['atr'])
+        atr_mean = float(df['atr'].rolling(20).mean().iloc[-1])
+        volume_current = float(latest['volume'])
+        volume_mean = float(latest['volume_sma'])
         
-        # Logic checks
-        coil_squeeze = bandwidth < 0.08  # Bollinger squeeze < 8%
-        atr_low = atr_current < atr_mean  # ATR below average
-        volume_dry = volume_current < (volume_mean * 0.5)  # Volume < 50% avg
-        bullish = latest['ema_12'] > latest['ema_26']
+        # Logic checks - Python booleans only
+        coil_squeeze = bool(bandwidth < 0.08)
+        atr_low = bool(atr_current < atr_mean)
+        volume_dry = bool(volume_current < (volume_mean * 0.5))
+        bullish = bool(latest['ema_12'] > latest['ema_26'])
         
         is_coil = coil_squeeze and atr_low and volume_dry
         
-        # Build response data (ALWAYS returned, even if no coil)
         data = {
-            'symbol': symbol,
+            'symbol': str(symbol),
             'coil_detected': bool(is_coil),
-            'current_price': float(latest['close']),
-            'bandwidth': float(bandwidth),
+            'current_price': safe_float(latest['close']),
+            'bandwidth': bandwidth,
             'bandwidth_threshold': 0.08,
-            'atr': float(atr_current),
-            'atr_average': float(atr_mean),
-            'atr_low': bool(atr_low),
-            'volume': float(volume_current),
-            'volume_average': float(volume_mean),
-            'volume_dry': bool(volume_dry),
+            'atr': atr_current,
+            'atr_average': atr_mean,
+            'atr_low': atr_low,
+            'volume': volume_current,
+            'volume_average': volume_mean,
+            'volume_dry': volume_dry,
             'trend': 'bullish' if bullish else 'bearish',
-            'bb_upper': float(latest['bb_upper']),
-            'bb_lower': float(latest['bb_lower']),
+            'bb_upper': safe_float(latest['bb_upper']),
+            'bb_lower': safe_float(latest['bb_lower']),
             'timestamp': str(df.index[-1])
         }
         
-        # Debug print (shows in Railway logs)
-        print(f"{symbol}: Bandwidth={bandwidth:.4f}, "
-              f"ATR_low={atr_low}, Vol_dry={volume_dry}, "
-              f"Trend={'Bull' if bullish else 'Bear'}, "
-              f"COIL={is_coil}")
+        print(f"{symbol}: Bandwidth={bandwidth:.4f}, ATR_low={atr_low}, Vol_dry={volume_dry}, Trend={'Bull' if bullish else 'Bear'}, COIL={is_coil}")
         
-        return is_coil, data
+        return bool(is_coil), data
         
     except Exception as e:
         error_msg = str(e)
         print(f"Error detecting coil for {symbol}: {error_msg}")
         
-        # Return partial data with error info
         return False, {
-            'symbol': symbol,
+            'symbol': str(symbol),
             'coil_detected': False,
             'error': error_msg,
             'current_price': None,
