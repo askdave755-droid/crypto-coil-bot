@@ -1,4 +1,4 @@
-from fastapi import FastAPI, BackgroundTasks, HTTPException
+from fastapi import FastAPI, HTTPException
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
@@ -23,7 +23,7 @@ def root():
     return {
         "message": "Crypto Coil Bot Running",
         "version": "1.0",
-        "paper_trading": PAPER,
+        "paper_trading": bool(PAPER),
         "endpoints": ["/health", "/scan", "/test-scan", "/execute"]
     }
 
@@ -31,7 +31,7 @@ def root():
 def health():
     return {
         "status": "coil_bot_active",
-        "paper": PAPER,
+        "paper": bool(PAPER),
         "assets": ["BTC/USD", "ETH/USD"],
         "timestamp": datetime.utcnow().isoformat()
     }
@@ -43,7 +43,7 @@ def test_scan():
         is_coil, data = detect_coil("BTC/USD", data_client)
         return {
             "symbol": "BTC/USD",
-            "coil_detected": is_coil,
+            "coil_detected": bool(is_coil),
             "data": data,
             "timestamp": datetime.utcnow().isoformat()
         }
@@ -61,7 +61,7 @@ def scan_coils():
             is_coil, data = detect_coil(symbol, data_client)
             if is_coil:
                 signals.append({
-                    "symbol": symbol,
+                    "symbol": str(symbol),
                     "action": "coil_detected",
                     "data": data,
                     "timestamp": datetime.utcnow().isoformat()
@@ -71,7 +71,7 @@ def scan_coils():
     
     return {
         "signals": signals,
-        "count": len(signals),
+        "count": int(len(signals)),
         "scanned": symbols,
         "timestamp": datetime.utcnow().isoformat()
     }
@@ -80,14 +80,11 @@ def scan_coils():
 def execute_trade(symbol: str, direction: str, notional: float = 250.0):
     """Execute a trade on Alpaca"""
     try:
-        # Risk guard - check daily loss
-        # TODO: Implement daily P&L check from database
-        
         side = OrderSide.BUY if direction == "long" else OrderSide.SELL
         
         order = MarketOrderRequest(
             symbol=symbol,
-            notional=notional,
+            notional=float(notional),
             side=side,
             time_in_force=TimeInForce.GTC
         )
@@ -96,17 +93,13 @@ def execute_trade(symbol: str, direction: str, notional: float = 250.0):
         
         return {
             "success": True,
-            "order_id": result.id,
+            "order_id": str(result.id),
             "symbol": symbol,
             "side": direction,
-            "notional": notional,
-            "status": result.status,
+            "notional": float(notional),
+            "status": str(result.status),
             "timestamp": datetime.utcnow().isoformat()
         }
         
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
