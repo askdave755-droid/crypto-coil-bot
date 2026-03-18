@@ -1,0 +1,9 @@
+fastapi==0.109.0
+uvicorn==0.27.0
+alpaca-py==0.32.0        # Alpaca official SDK
+pandas==2.2.0
+pandas-ta==0.3.14b0       # Technical indicators (ATR, Bollinger)
+psycopg2-binary==2.9.9
+APScheduler==3.10.0      # Cron jobs for scanning
+httpx==0.27.0            # Async HTTP (pin per your Carrier AI memory ID 62)
+python-dotenv==1.0.0
