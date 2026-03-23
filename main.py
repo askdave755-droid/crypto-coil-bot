@@ -192,6 +192,22 @@ try:
     scheduler.add_job(monitor_exits, 'interval', minutes=5, id='exit_monitor')
     
     scheduler.start()
+    # Sync existing positions on startup
+try:
+    logger.info("Syncing existing positions...")
+    for position in trade_client.get_all_positions():
+        symbol = position.symbol
+        tracker.positions[symbol] = {
+            'entry_price': float(position.avg_entry_price),
+            'entry_time': datetime.utcnow(),  # Approximate
+            'side': 'long' if float(position.qty) > 0 else 'short',
+            'notional': float(position.market_value),
+            'stop_loss': float(position.avg_entry_price) * 0.98,
+            'take_profit': float(position.avg_entry_price) * 1.04
+        }
+        logger.info(f"Synced {symbol}: {position.qty} @ ${position.avg_entry_price}")
+except Exception as e:
+    logger.info(f"No positions to sync: {e}")
     logger.info("🤖 BOT STARTED: Entry (15m) + Exit (5m) monitoring")
 except Exception as e:
     logger.error(f"Scheduler failed: {e}")
