@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest
+from alpaca.trading.requests import MarketOrderRequest, ClosePositionRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.data.historical.crypto import CryptoHistoricalDataClient
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -32,108 +32,269 @@ except Exception as e:
     trade_client = None
     data_client = None
 
-# ========== STATE ==========
-class State:
+# ========== POSITION TRACKER ==========
+class PositionTracker:
+    def __init__(self):
+        self.positions = {}  # symbol -> {entry_price, entry_time, side, notional, stop_loss, take_profit}
+        self.max_hold_hours = 4
+        self.stop_loss_pct = 0.02  # 2%
+        self.take_profit_pct = 0.04  # 4%
+    
+    def add_position(self, symbol, side, notional, entry_price):
+        """Track new position with exit levels"""
+        self.positions[symbol] = {
+            'entry_price': float(entry_price),
+            'entry_time': datetime.utcnow(),
+            'side': side,
+            'notional': float(notional),
+            'stop_loss': float(entry_price) * (0.98 if side == 'long' else 1.02),
+            'take_profit': float(entry_price) * (1.04 if side == 'long' else 0.96),
+            'order_id': None
+        }
+        logger.info(f"📊 TRACKING: {symbol} {side} @ ${entry_price:.2f} | SL: ${self.positions[symbol]['stop_loss']:.2f} | TP: ${self.positions[symbol]['take_profit']:.2f}")
+    
+    def should_exit(self, symbol, current_price):
+        """Check if position should be closed"""
+        if symbol not in self.positions:
+            return False, None
+        
+        pos = self.positions[symbol]
+        side = pos['side']
+        entry = pos['entry_price']
+        
+        # Calculate P&L
+        if side == 'long':
+            pnl_pct = (current_price - entry) / entry
+            hit_stop = current_price <= pos['stop_loss']
+            hit_target = current_price >= pos['take_profit']
+        else:
+            pnl_pct = (entry - current_price) / entry
+            hit_stop = current_price >= pos['stop_loss']
+            hit_target = current_price <= pos['take_profit']
+        
+        # Time exit
+        time_held = datetime.utcnow() - pos['entry_time']
+        hit_time_limit = time_held > timedelta(hours=self.max_hold_hours)
+        
+        if hit_stop:
+            return True, f"STOP LOSS ({pnl_pct*100:.2f}%)"
+        elif hit_target:
+            return True, f"TAKE PROFIT ({pnl_pct*100:.2f}%)"
+        elif hit_time_limit:
+            return True, f"TIME EXIT ({time_held.total_seconds()/3600:.1f}h)"
+        
+        return False, None
+    
+    def remove_position(self, symbol):
+        """Remove from tracking"""
+        if symbol in self.positions:
+            del self.positions[symbol]
+
+tracker = PositionTracker()
+
+# ========== AUTO SCANNER (ENTRY) ==========
+class ScanState:
     def __init__(self):
         self.scan_count = 0
         self.last_scan = None
         self.coils = 0
+        self.trades_today = 0
 
-state = State()
+scan_state = ScanState()
 
-# ========== AUTO SCANNER ==========
 def run_scan():
+    """Look for entry opportunities"""
     try:
-        logger.info(f"Scan #{state.scan_count + 1} at {datetime.utcnow().strftime('%H:%M')}")
+        logger.info(f"\n🔍 ENTRY SCAN #{scan_state.scan_count + 1}")
         from coil.detector import detect_coil
         
         for symbol in ["BTC/USD", "ETH/USD"]:
+            # Skip if already in position
+            if symbol in tracker.positions:
+                logger.info(f"{symbol}: Already holding position")
+                continue
+            
             try:
                 is_coil, data = detect_coil(symbol, data_client)
-                logger.info(f"{symbol}: Coil={is_coil}, Price=${data.get('current_price', 'N/A')}")
-                if is_coil:
-                    state.coils += 1
+                price = data.get('current_price', 0)
+                
+                logger.info(f"{symbol}: Coil={is_coil}, Price=${price:.2f}")
+                
+                if is_coil and price > 0:
+                    scan_state.coils += 1
+                    direction = 'long' if data.get('trend') == 'bullish' else 'short'
+                    
+                    # Execute entry
+                    result = execute_trade(symbol, direction, 250.0)
+                    
+                    if result.get('success'):
+                        tracker.add_position(symbol, direction, 250.0, price)
+                        scan_state.trades_today += 1
+                        logger.info(f"🎯 ENTRY: {symbol} {direction} @ ${price:.2f}")
+                    else:
+                        logger.error(f"Entry failed: {result.get('error')}")
+                        
             except Exception as e:
                 logger.error(f"Scan error {symbol}: {e}")
         
-        state.scan_count += 1
-        state.last_scan = datetime.utcnow()
+        scan_state.scan_count += 1
+        scan_state.last_scan = datetime.utcnow()
+        logger.info(f"Scan complete. Trades today: {scan_state.trades_today}")
+        
     except Exception as e:
         logger.error(f"Scanner crash: {e}")
 
-# Start scheduler
+# ========== EXIT MONITOR (Runs every 5 minutes) ==========
+def monitor_exits():
+    """Check positions and close if hit SL/TP/Time"""
+    if not trade_client:
+        return
+    
+    try:
+        for symbol in list(tracker.positions.keys()):
+            try:
+                # Get current position from Alpaca
+                position = trade_client.get_open_position(symbol)
+                current_price = float(position.current_price)
+                qty = float(position.qty)
+                
+                # Check if should exit
+                should_exit, reason = tracker.should_exit(symbol, current_price)
+                
+                if should_exit:
+                    # Close position
+                    trade_client.close_position(symbol)
+                    tracker.remove_position(symbol)
+                    
+                    logger.info(f"💰 EXIT: {symbol} | Reason: {reason} | Price: ${current_price:.2f}")
+                else:
+                    # Log current P&L
+                    entry = tracker.positions[symbol]['entry_price']
+                    pnl = ((current_price - entry) / entry) * 100
+                    logger.info(f"📈 HOLDING: {symbol} | P&L: {pnl:+.2f}% | Current: ${current_price:.2f}")
+                    
+            except Exception as e:
+                # Position probably already closed
+                logger.warning(f"Exit check failed for {symbol}: {e}")
+                tracker.remove_position(symbol)
+                
+    except Exception as e:
+        logger.error(f"Exit monitor error: {e}")
+
+# Start schedulers
 try:
     scheduler = BackgroundScheduler()
-    scheduler.add_job(run_scan, 'interval', minutes=15)
+    
+    # Entry scanner every 15 min
+    scheduler.add_job(run_scan, 'interval', minutes=15, id='entry_scanner')
+    
+    # Exit monitor every 5 min
+    scheduler.add_job(monitor_exits, 'interval', minutes=5, id='exit_monitor')
+    
     scheduler.start()
-    logger.info("Scheduler started")
+    logger.info("🤖 BOT STARTED: Entry (15m) + Exit (5m) monitoring")
 except Exception as e:
     logger.error(f"Scheduler failed: {e}")
     scheduler = None
 
-# ========== ENDPOINTS ==========
+# ========== API ENDPOINTS ==========
 @app.get("/")
 def root():
     return {
-        "bot": "Crypto Coil Bot",
+        "bot": "Crypto Coil Bot v2.0",
+        "features": ["Auto-Entry", "Auto-Exit (SL/TP/Time)"],
         "status": "running",
         "paper": PAPER,
-        "endpoints": ["/health", "/debug", "/trade", "/scan"]
+        "endpoints": ["/health", "/debug", "/trade", "/positions", "/close"]
     }
 
 @app.get("/health")
 def health():
     return {
         "status": "running",
-        "scans": state.scan_count,
+        "scans": scan_state.scan_count,
+        "open_positions": len(tracker.positions),
+        "trades_today": scan_state.trades_today,
         "api_connected": trade_client is not None,
         "timestamp": datetime.utcnow().isoformat()
     }
 
+@app.get("/positions")
+def get_positions():
+    """See tracked positions with exit levels"""
+    return {
+        "positions": tracker.positions,
+        "exit_rules": {
+            "stop_loss": f"{tracker.stop_loss_pct*100}%",
+            "take_profit": f"{tracker.take_profit_pct*100}%",
+            "max_hold": f"{tracker.max_hold_hours}h"
+        }
+    }
+
 @app.get("/debug")
 def debug():
-    """Check account balance and ID"""
+    """Check account"""
     if not trade_client:
         return {"error": "Not connected"}
     try:
         acc = trade_client.get_account()
+        positions = []
+        try:
+            for p in trade_client.get_all_positions():
+                positions.append({
+                    "symbol": p.symbol,
+                    "qty": p.qty,
+                    "current_price": p.current_price,
+                    "market_value": p.market_value
+                })
+        except:
+            pass
+            
         return {
             "account_id": acc.id,
             "cash": float(acc.cash),
             "buying_power": float(acc.buying_power),
-            "portfolio_value": float(acc.portfolio_value),
-            "status": acc.status
+            "open_positions": positions
         }
     except Exception as e:
         return {"error": str(e)}
 
 @app.get("/trade")
-def trade_get(symbol: str, direction: str, notional: float = 10):
-    """GET method for easy browser testing"""
-    return execute_trade(symbol, direction, notional)
+def trade_get(symbol: str, direction: str, notional: float = 250):
+    """Manual trade with auto-tracking"""
+    result = execute_trade(symbol, direction, notional)
+    if result.get('success'):
+        # Get current price for tracking
+        try:
+            pos = trade_client.get_open_position(symbol)
+            tracker.add_position(symbol, direction, notional, float(pos.current_price))
+        except:
+            pass
+    return result
 
-@app.post("/trade")
-def trade_post(symbol: str, direction: str, notional: float = 10):
-    """POST method for proper API calls"""
-    return execute_trade(symbol, direction, notional)
+@app.get("/close")
+def close_position(symbol: str = "BTC/USD"):
+    """Manual close"""
+    try:
+        trade_client.close_position(symbol)
+        tracker.remove_position(symbol)
+        return {"success": True, "message": f"Closed {symbol}"}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 def execute_trade(symbol, direction, notional):
-    """Execute trade with error handling"""
+    """Execute trade"""
     if not trade_client:
-        return {"error": "Trading not initialized"}
-    
+        return {"error": "Not initialized"}
     try:
         side = OrderSide.BUY if direction == "long" else OrderSide.SELL
-        
         order = MarketOrderRequest(
             symbol=symbol,
             notional=float(notional),
             side=side,
             time_in_force=TimeInForce.GTC
         )
-        
         result = trade_client.submit_order(order)
-        
         return {
             "success": True,
             "order_id": str(result.id),
@@ -144,16 +305,6 @@ def execute_trade(symbol, direction, notional):
         }
     except Exception as e:
         return {"success": False, "error": str(e)}
-
-@app.get("/scan")
-def manual_scan():
-    """Force a scan now"""
-    run_scan()
-    return {
-        "scans_total": state.scan_count,
-        "coils_total": state.coils,
-        "timestamp": datetime.utcnow().isoformat()
-    }
 
 if __name__ == "__main__":
     import uvicorn
