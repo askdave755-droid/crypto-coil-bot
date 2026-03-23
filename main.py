@@ -112,13 +112,19 @@ except Exception as e:
     scheduler = None
 
 # ========== API ENDPOINTS ==========
-@app.get("/")
-def root():
-    return {
-        "bot": "Crypto Coil Bot",
-        "status": "running" if scheduler else "scheduler_failed",
-        "paper": PAPER if 'PAPER' in locals() else 'unknown',
-        "endpoints": ["/health", "/status", "/scan", "/test"]
+@app.get("/debug")
+def debug():
+    """See which account we're connected to"""
+    try:
+        acc = trade_client.get_account()
+        return {
+            "account_id": acc.id,
+            "cash": float(acc.cash),
+            "buying_power": float(acc.buying_power),
+            "target_account": "PA3D1GO63T5L"
+        }
+    except Exception as e:
+        return {"error": str(e)}
     }
 
 @app.get("/health")
