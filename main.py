@@ -103,3 +103,12 @@ def execute_trade(symbol: str, direction: str, notional: float = 250.0):
         
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+# Add these imports at top
+from apscheduler.schedulers.background import BackgroundScheduler
+import atexit
+
+# Add this at bottom (before if __name__)
+scheduler = BackgroundScheduler()
+scheduler.add_job(lambda: print(f"Scan at {datetime.utcnow()}: No coil"), 'interval', minutes=15)
+scheduler.start()
+atexit.register(lambda: scheduler.shutdown())
